@@ -343,46 +343,91 @@
         // ========== 多层数据存储 ==========
         const STORAGE_KEY = 'bpRecords';
         const BACKUP_KEY = 'bpRecords_backup';
+        const BACKUP2_KEY = 'bpRecords_backup2';
         const LAST_BACKUP_KEY = 'bp_lastBackupTime';
 
         let bpRecords = [];
         let chart = null;
 
-        // 从多个存储位置加载数据（优先级：localStorage > backup > IndexedDB）
-        function loadAllData() {
-            // 1. 先从localStorage加载
-            let data = localStorage.getItem(STORAGE_KEY);
+        // 安全解析JSON，容错处理
+        function safeParse(str) {
+            if (!str) return null;
+            try {
+                const data = JSON.parse(str);
+                if (Array.isArray(data) && data.length > 0) return data;
+            } catch (e) {
+                console.log('JSON解析失败，尝试修复...');
+            }
+            return null;
+        }
+
+        // 从多个存储位置加载数据（全部同步尝试，再异步尝试IndexedDB）
+        async function loadAllData() {
+            // 1. localStorage 主存储
+            let data = safeParse(localStorage.getItem(STORAGE_KEY));
             if (data) {
-                try {
-                    bpRecords = JSON.parse(data);
-                    console.log('从localStorage加载数据成功，共' + bpRecords.length + '条');
-                    return;
-                } catch (e) {
-                    console.log('localStorage数据损坏');
+                bpRecords = data;
+                console.log('✅ localStorage主存储加载成功，共' + bpRecords.length + '条');
+                return;
+            }
+
+            // 2. localStorage 备份1
+            data = safeParse(localStorage.getItem(BACKUP_KEY));
+            if (data) {
+                bpRecords = data;
+                console.log('✅ localStorage备份1加载成功，共' + bpRecords.length + '条');
+                saveData();
+                return;
+            }
+
+            // 3. localStorage 备份2
+            data = safeParse(localStorage.getItem(BACKUP2_KEY));
+            if (data) {
+                bpRecords = data;
+                console.log('✅ localStorage备份2加载成功，共' + bpRecords.length + '条');
+                saveData();
+                return;
+            }
+
+            // 4. 扫描所有localStorage键，查找可能的旧数据
+            for (let i = 0; i < localStorage.length; i++) {
+                const key = localStorage.key(i);
+                if (key && (key.includes('bp') || key.includes('blood') || key.includes('record'))) {
+                    data = safeParse(localStorage.getItem(key));
+                    if (data && data.length > 0 && data[0].systolic) {
+                        bpRecords = data;
+                        console.log('✅ 从localStorage键"' + key + '"恢复数据成功，共' + bpRecords.length + '条');
+                        saveData();
+                        return;
+                    }
                 }
             }
 
-            // 2. 从备份localStorage加载
-            let backup = localStorage.getItem(BACKUP_KEY);
-            if (backup) {
-                try {
-                    bpRecords = JSON.parse(backup);
-                    console.log('从备份加载数据成功，共' + bpRecords.length + '条');
-                    saveData(); // 恢复到主存储
+            // 5. IndexedDB（异步）
+            try {
+                const idbData = await loadFromIndexedDB();
+                if (idbData && idbData.length > 0) {
+                    bpRecords = idbData;
+                    console.log('✅ IndexedDB加载成功，共' + bpRecords.length + '条');
+                    saveData();
                     return;
-                } catch (e) {}
+                }
+            } catch (e) {
+                console.log('IndexedDB加载失败:', e);
             }
 
-            // 3. 从IndexedDB加载
-            loadFromIndexedDB();
+            console.log('⚠️ 所有存储位置均无数据');
         }
 
-        // IndexedDB 存储（更持久）
+        // IndexedDB 存储
         function openDB() {
             return new Promise((resolve, reject) => {
-                const request = indexedDB.open('BloodPressureDB', 1);
+                const request = indexedDB.open('BloodPressureDB', 2);
                 request.onupgradeneeded = (e) => {
-                    e.target.result.createObjectStore('records', { keyPath: 'id' });
+                    const db = e.target.result;
+                    if (!db.objectStoreNames.contains('records')) {
+                        db.createObjectStore('records', { keyPath: 'id' });
+                    }
                 };
                 request.onsuccess = (e) => resolve(e.target.result);
                 request.onerror = (e) => reject(e);
@@ -394,7 +439,6 @@
                 const db = await openDB();
                 const tx = db.transaction('records', 'readwrite');
                 const store = tx.objectStore('records');
-                // 先清空再写入
                 store.clear();
                 for (const record of bpRecords) {
                     store.put(record);
@@ -403,7 +447,6 @@
                     tx.oncomplete = resolve;
                     tx.onerror = reject;
                 });
-                console.log('IndexedDB保存成功');
             } catch (e) {
                 console.log('IndexedDB保存失败:', e);
             }
@@ -415,31 +458,28 @@
                 const tx = db.transaction('records', 'readonly');
                 const store = tx.objectStore('records');
                 const request = store.getAll();
-                await new Promise((resolve, reject) => {
-                    request.onsuccess = resolve;
-                    request.onerror = reject;
+                return new Promise((resolve) => {
+                    request.onsuccess = () => resolve(request.result || []);
+                    request.onerror = () => resolve([]);
                 });
-                if (request.result && request.result.length > 0) {
-                    bpRecords = request.result;
-                    console.log('从IndexedDB加载数据成功，共' + bpRecords.length + '条');
-                    saveData();
-                }
             } catch (e) {
-                console.log('IndexedDB加载失败:', e);
+                return [];
             }
         }
 
-        // ========== 数据保存（三层备份） ==========
+        // ========== 数据保存（四层备份） ==========
         function saveData() {
+            const jsonStr = JSON.stringify(bpRecords);
             // 第1层：localStorage 主存储
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(bpRecords));
-            // 第2层：localStorage 备份
-            localStorage.setItem(BACKUP_KEY, JSON.stringify(bpRecords));
-            // 第3层：IndexedDB
+            localStorage.setItem(STORAGE_KEY, jsonStr);
+            // 第2层：localStorage 备份1
+            localStorage.setItem(BACKUP_KEY, jsonStr);
+            // 第3层：localStorage 备份2（额外保险）
+            localStorage.setItem(BACKUP2_KEY, jsonStr);
+            // 第4层：IndexedDB
             saveToIndexedDB();
             // 更新备份时间
-            const now = new Date().toISOString();
-            localStorage.setItem(LAST_BACKUP_KEY, now);
+            localStorage.setItem(LAST_BACKUP_KEY, new Date().toISOString());
             updateBackupStatus();
         }
 
@@ -661,9 +701,9 @@
             other: '其他'
         };
 
-        document.addEventListener('DOMContentLoaded', function() {
-            // 加载数据（从多层存储）
-            loadAllData();
+        document.addEventListener('DOMContentLoaded', async function() {
+            // 先等数据加载完成（关键修复！）
+            await loadAllData();
 
             const now = new Date();
             now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
