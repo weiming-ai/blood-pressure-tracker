@@ -56,6 +56,13 @@
         .animate-fade-in {
             animation: fadeIn 0.5s ease;
         }
+        .backup-pulse {
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
     </style>
 </head>
 <body class="p-4">
@@ -65,7 +72,7 @@
             <h1 class="text-4xl font-bold text-white mb-2">
                 <i class="fas fa-heart-pulse mr-3"></i>健康血压
             </h1>
-            <p class="text-white/80">智能记录 · 趋势分析 · 照片识别 · 自动读取拍摄时间</p>
+            <p class="text-white/80">智能记录 · 趋势分析 · 照片识别 · 数据云备份</p>
         </header>
 
         <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -155,6 +162,24 @@
 
             <!-- 右侧：数据展示 -->
             <div class="lg:col-span-2 space-y-6">
+                <!-- 备份状态栏 -->
+                <div class="glass p-3 flex items-center justify-between" id="backupBar">
+                    <div class="flex items-center text-sm">
+                        <i class="fas fa-shield-alt text-green-500 mr-2" id="backupIcon"></i>
+                        <span id="backupStatus" class="text-gray-600">数据保护已启用</span>
+                        <span class="text-gray-400 mx-2">|</span>
+                        <span id="lastBackupTime" class="text-gray-400">上次备份：从未</span>
+                    </div>
+                    <div class="flex gap-2">
+                        <button onclick="backupToCloud()" class="px-3 py-1.5 bg-indigo-500 text-white text-sm rounded-lg hover:bg-indigo-600 transition" title="云备份">
+                            <i class="fas fa-cloud-upload-alt mr-1"></i>云备份
+                        </button>
+                        <button onclick="restoreFromCloud()" class="px-3 py-1.5 bg-green-500 text-white text-sm rounded-lg hover:bg-green-600 transition" title="云恢复">
+                            <i class="fas fa-cloud-download-alt mr-1"></i>云恢复
+                        </button>
+                    </div>
+                </div>
+
                 <!-- 统计卡片 -->
                 <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
                     <div class="glass p-4 text-center">
@@ -191,15 +216,21 @@
 
                 <!-- 数据表格 -->
                 <div class="glass p-6">
-                    <div class="flex justify-between items-center mb-4">
+                    <div class="flex flex-wrap justify-between items-center mb-4 gap-2">
                         <h2 class="text-xl font-bold text-gray-800">
                             <i class="fas fa-table mr-2 text-indigo-600"></i>测量记录
                         </h2>
-                        <div class="space-x-2">
-                            <button onclick="exportData()" class="px-4 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition">
-                                <i class="fas fa-download mr-1"></i>导出
+                        <div class="flex flex-wrap gap-2">
+                            <button onclick="importData()" class="px-3 py-2 bg-blue-500 text-white rounded-lg hover:bg-blue-600 transition text-sm">
+                                <i class="fas fa-file-import mr-1"></i>导入
                             </button>
-                            <button onclick="clearAllData()" class="px-4 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition">
+                            <button onclick="exportData()" class="px-3 py-2 bg-green-500 text-white rounded-lg hover:bg-green-600 transition text-sm">
+                                <i class="fas fa-download mr-1"></i>导出CSV
+                            </button>
+                            <button onclick="backupToFile()" class="px-3 py-2 bg-purple-500 text-white rounded-lg hover:bg-purple-600 transition text-sm">
+                                <i class="fas fa-save mr-1"></i>备份文件
+                            </button>
+                            <button onclick="clearAllData()" class="px-3 py-2 bg-red-500 text-white rounded-lg hover:bg-red-600 transition text-sm">
                                 <i class="fas fa-trash mr-1"></i>清空
                             </button>
                         </div>
@@ -218,7 +249,6 @@
                                 </tr>
                             </thead>
                             <tbody id="recordsTable">
-                                <!-- 记录将在这里动态生成 -->
                             </tbody>
                         </table>
                     </div>
@@ -306,12 +336,324 @@
         </div>
     </div>
 
+    <!-- 隐藏的文件输入 -->
+    <input type="file" id="importInput" accept=".json,.csv" class="hidden">
+
     <script>
-        // 数据存储
-        let bpRecords = JSON.parse(localStorage.getItem('bpRecords')) || [];
+        // ========== 多层数据存储 ==========
+        const STORAGE_KEY = 'bpRecords';
+        const BACKUP_KEY = 'bpRecords_backup';
+        const LAST_BACKUP_KEY = 'bp_lastBackupTime';
+
+        let bpRecords = [];
         let chart = null;
 
-        // 时段标签
+        // 从多个存储位置加载数据（优先级：localStorage > backup > IndexedDB）
+        function loadAllData() {
+            // 1. 先从localStorage加载
+            let data = localStorage.getItem(STORAGE_KEY);
+            if (data) {
+                try {
+                    bpRecords = JSON.parse(data);
+                    console.log('从localStorage加载数据成功，共' + bpRecords.length + '条');
+                    return;
+                } catch (e) {
+                    console.log('localStorage数据损坏');
+                }
+            }
+
+            // 2. 从备份localStorage加载
+            let backup = localStorage.getItem(BACKUP_KEY);
+            if (backup) {
+                try {
+                    bpRecords = JSON.parse(backup);
+                    console.log('从备份加载数据成功，共' + bpRecords.length + '条');
+                    saveData(); // 恢复到主存储
+                    return;
+                } catch (e) {}
+            }
+
+            // 3. 从IndexedDB加载
+            loadFromIndexedDB();
+        }
+
+        // IndexedDB 存储（更持久）
+        function openDB() {
+            return new Promise((resolve, reject) => {
+                const request = indexedDB.open('BloodPressureDB', 1);
+                request.onupgradeneeded = (e) => {
+                    e.target.result.createObjectStore('records', { keyPath: 'id' });
+                };
+                request.onsuccess = (e) => resolve(e.target.result);
+                request.onerror = (e) => reject(e);
+            });
+        }
+
+        async function saveToIndexedDB() {
+            try {
+                const db = await openDB();
+                const tx = db.transaction('records', 'readwrite');
+                const store = tx.objectStore('records');
+                // 先清空再写入
+                store.clear();
+                for (const record of bpRecords) {
+                    store.put(record);
+                }
+                await new Promise((resolve, reject) => {
+                    tx.oncomplete = resolve;
+                    tx.onerror = reject;
+                });
+                console.log('IndexedDB保存成功');
+            } catch (e) {
+                console.log('IndexedDB保存失败:', e);
+            }
+        }
+
+        async function loadFromIndexedDB() {
+            try {
+                const db = await openDB();
+                const tx = db.transaction('records', 'readonly');
+                const store = tx.objectStore('records');
+                const request = store.getAll();
+                await new Promise((resolve, reject) => {
+                    request.onsuccess = resolve;
+                    request.onerror = reject;
+                });
+                if (request.result && request.result.length > 0) {
+                    bpRecords = request.result;
+                    console.log('从IndexedDB加载数据成功，共' + bpRecords.length + '条');
+                    saveData();
+                }
+            } catch (e) {
+                console.log('IndexedDB加载失败:', e);
+            }
+        }
+
+        // ========== 数据保存（三层备份） ==========
+        function saveData() {
+            // 第1层：localStorage 主存储
+            localStorage.setItem(STORAGE_KEY, JSON.stringify(bpRecords));
+            // 第2层：localStorage 备份
+            localStorage.setItem(BACKUP_KEY, JSON.stringify(bpRecords));
+            // 第3层：IndexedDB
+            saveToIndexedDB();
+            // 更新备份时间
+            const now = new Date().toISOString();
+            localStorage.setItem(LAST_BACKUP_KEY, now);
+            updateBackupStatus();
+        }
+
+        // ========== 云备份（使用jsonbin.io免费服务） ==========
+        const JSONBIN_API = 'https://api.jsonbin.io/v3';
+        const BIN_ID_KEY = 'bp_jsonbin_id';
+
+        function getBinId() {
+            return localStorage.getItem(BIN_ID_KEY);
+        }
+
+        async function backupToCloud() {
+            if (bpRecords.length === 0) {
+                alert('暂无数据需要备份');
+                return;
+            }
+
+            const binId = getBinId();
+            const data = JSON.stringify({
+                records: bpRecords,
+                backupTime: new Date().toISOString(),
+                version: 2
+            });
+
+            try {
+                document.getElementById('backupStatus').textContent = '正在备份...';
+                document.getElementById('backupIcon').className = 'fas fa-spinner fa-spin text-yellow-500 mr-2 backup-pulse';
+
+                let resp;
+                if (binId) {
+                    // 更新已有bin
+                    resp = await fetch(`${JSONBIN_API}/b/${binId}`, {
+                        method: 'PUT',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: data
+                    });
+                } else {
+                    // 创建新bin
+                    resp = await fetch(`${JSONBIN_API}/b`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: data
+                    });
+                }
+
+                if (resp.ok) {
+                    const result = await resp.json();
+                    const newBinId = result.metadata?.id || result.id;
+                    if (newBinId && !binId) {
+                        localStorage.setItem(BIN_ID_KEY, newBinId);
+                    }
+                    const now = new Date().toLocaleString('zh-CN');
+                    localStorage.setItem(LAST_BACKUP_KEY, new Date().toISOString());
+                    document.getElementById('backupStatus').textContent = '云备份成功！';
+                    document.getElementById('backupIcon').className = 'fas fa-check-circle text-green-500 mr-2';
+                    setTimeout(() => {
+                        document.getElementById('backupStatus').textContent = '数据保护已启用';
+                        document.getElementById('backupIcon').className = 'fas fa-shield-alt text-green-500 mr-2';
+                    }, 3000);
+                    updateBackupStatus();
+                } else {
+                    throw new Error('备份失败: ' + resp.status);
+                }
+            } catch (e) {
+                console.error('云备份失败:', e);
+                document.getElementById('backupStatus').textContent = '云备份失败，已保存本地';
+                document.getElementById('backupIcon').className = 'fas fa-exclamation-circle text-yellow-500 mr-2';
+                setTimeout(() => {
+                    document.getElementById('backupStatus').textContent = '数据保护已启用（仅本地）';
+                    document.getElementById('backupIcon').className = 'fas fa-shield-alt text-yellow-500 mr-2';
+                }, 3000);
+            }
+        }
+
+        async function restoreFromCloud() {
+            const binId = getBinId();
+            if (!binId) {
+                alert('尚未进行过云备份，无法恢复');
+                return;
+            }
+
+            if (!confirm('将从云端恢复数据，当前本地数据将被替换。确定继续吗？')) return;
+
+            try {
+                document.getElementById('backupStatus').textContent = '正在从云端恢复...';
+                document.getElementById('backupIcon').className = 'fas fa-spinner fa-spin text-blue-500 mr-2 backup-pulse';
+
+                const resp = await fetch(`${JSONBIN_API}/b/${binId}/latest`);
+                if (resp.ok) {
+                    const result = await resp.json();
+                    const cloudData = result.record;
+                    if (cloudData && cloudData.records) {
+                        bpRecords = cloudData.records;
+                        saveData();
+                        renderTable();
+                        updateStats();
+                        updateChart();
+                        document.getElementById('backupStatus').textContent = '云端恢复成功！';
+                        document.getElementById('backupIcon').className = 'fas fa-check-circle text-green-500 mr-2';
+                        setTimeout(() => {
+                            document.getElementById('backupStatus').textContent = '数据保护已启用';
+                            document.getElementById('backupIcon').className = 'fas fa-shield-alt text-green-500 mr-2';
+                        }, 3000);
+                    } else {
+                        throw new Error('云端数据格式错误');
+                    }
+                } else {
+                    throw new Error('恢复失败: ' + resp.status);
+                }
+            } catch (e) {
+                console.error('云端恢复失败:', e);
+                alert('云端恢复失败：' + e.message);
+                document.getElementById('backupStatus').textContent = '数据保护已启用';
+                document.getElementById('backupIcon').className = 'fas fa-shield-alt text-yellow-500 mr-2';
+            }
+        }
+
+        // ========== 文件备份与恢复 ==========
+        function backupToFile() {
+            if (bpRecords.length === 0) {
+                alert('暂无数据需要备份');
+                return;
+            }
+
+            const backupData = {
+                version: 2,
+                exportTime: new Date().toISOString(),
+                records: bpRecords
+            };
+
+            const blob = new Blob([JSON.stringify(backupData, null, 2)], { type: 'application/json' });
+            const link = document.createElement('a');
+            link.href = URL.createObjectURL(blob);
+            link.download = `血压数据备份_${new Date().toLocaleDateString('zh-CN').replace(/\//g, '-')}.json`;
+            link.click();
+            URL.revokeObjectURL(link.href);
+
+            // 同时做云备份
+            backupToCloud();
+        }
+
+        function importData() {
+            document.getElementById('importInput').click();
+        }
+
+        function handleImport(e) {
+            const file = e.target.files[0];
+            if (!file) return;
+
+            const reader = new FileReader();
+            reader.onload = (event) => {
+                try {
+                    const data = JSON.parse(event.target.result);
+
+                    if (data.records && Array.isArray(data.records)) {
+                        // JSON备份格式
+                        if (confirm(`发现 ${data.records.length} 条记录，是否导入？（将合并到现有数据中）`)) {
+                            // 合并数据，避免重复
+                            const existingIds = new Set(bpRecords.map(r => r.id));
+                            const newRecords = data.records.filter(r => !existingIds.has(r.id));
+                            bpRecords = [...bpRecords, ...newRecords];
+                            bpRecords.sort((a, b) => new Date(b.measureTime) - new Date(a.measureTime));
+                            saveData();
+                            renderTable();
+                            updateStats();
+                            updateChart();
+                            alert(`成功导入 ${newRecords.length} 条新记录！`);
+                        }
+                    } else if (Array.isArray(data)) {
+                        // 旧格式（直接是数组）
+                        if (confirm(`发现 ${data.length} 条记录，是否导入？（将合并到现有数据中）`)) {
+                            const existingIds = new Set(bpRecords.map(r => r.id));
+                            const newRecords = data.filter(r => !existingIds.has(r.id));
+                            bpRecords = [...bpRecords, ...newRecords];
+                            bpRecords.sort((a, b) => new Date(b.measureTime) - new Date(a.measureTime));
+                            saveData();
+                            renderTable();
+                            updateStats();
+                            updateChart();
+                            alert(`成功导入 ${newRecords.length} 条新记录！`);
+                        }
+                    } else {
+                        alert('文件格式不正确，请选择之前导出的备份文件');
+                    }
+                } catch (err) {
+                    alert('文件读取失败，请确认文件格式正确');
+                    console.error('导入错误:', err);
+                }
+            };
+            reader.readAsText(file);
+            // 重置input，允许再次选择同一文件
+            e.target.value = '';
+        }
+
+        // ========== 更新备份状态 ==========
+        function updateBackupStatus() {
+            const lastBackup = localStorage.getItem(LAST_BACKUP_KEY);
+            if (lastBackup) {
+                const date = new Date(lastBackup);
+                document.getElementById('lastBackupTime').textContent =
+                    '上次备份：' + date.toLocaleString('zh-CN', { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+            }
+        }
+
+        // ========== 自动备份（每次数据变化时） ==========
+        function autoBackup() {
+            // 保存到localStorage备份
+            localStorage.setItem(BACKUP_KEY, JSON.stringify(bpRecords));
+            // 保存到IndexedDB
+            saveToIndexedDB();
+        }
+
+        // ========== 以下为原有功能 ==========
+
         const periodLabels = {
             morning: '上午',
             afternoon: '下午',
@@ -319,26 +661,31 @@
             other: '其他'
         };
 
-        // 初始化
         document.addEventListener('DOMContentLoaded', function() {
-            // 设置默认时间为当前时间
+            // 加载数据（从多层存储）
+            loadAllData();
+
             const now = new Date();
             now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
             document.getElementById('measureTime').value = now.toISOString().slice(0, 16);
 
-            // 加载数据
             renderTable();
             updateStats();
             initChart();
+            updateBackupStatus();
 
-            // 绑定表单提交
             document.getElementById('bpForm').addEventListener('submit', addRecord);
-
-            // 绑定编辑表单提交
             document.getElementById('editForm').addEventListener('submit', saveEdit);
+            document.getElementById('importInput').addEventListener('change', handleImport);
 
-            // 绑定照片上传
             setupPhotoUpload();
+
+            // 每5分钟自动云备份一次（如果有数据）
+            setInterval(() => {
+                if (bpRecords.length > 0) {
+                    backupToCloud();
+                }
+            }, 5 * 60 * 1000);
         });
 
         // 设置照片上传
@@ -373,19 +720,15 @@
             });
         }
 
-        // 从File对象读取EXIF日期时间
         function extractExifDateTime(file) {
             return new Promise((resolve) => {
                 EXIF.getData(file, function() {
                     const dateTimeOriginal = EXIF.getTag(this, 'DateTimeOriginal');
                     const dateTime = EXIF.getTag(this, 'DateTime');
                     const dateTimeDigitized = EXIF.getTag(this, 'DateTimeDigitized');
-
-                    // 优先使用 DateTimeOriginal，其次是 DateTime，最后是 DateTimeDigitized
                     const exifTime = dateTimeOriginal || dateTime || dateTimeDigitized;
 
                     if (exifTime) {
-                        // EXIF时间格式: "2024:01:15 14:30:25"
                         const parts = exifTime.split(' ');
                         const datePart = parts[0].replace(/:/g, '-');
                         const timePart = parts[1];
@@ -398,7 +741,6 @@
             });
         }
 
-        // 根据时间自动判断时段
         function getTimePeriodByHour(hour) {
             if (hour >= 6 && hour < 10) return 'morning';
             if (hour >= 14 && hour < 16) return 'afternoon';
@@ -406,11 +748,8 @@
             return 'other';
         }
 
-        // 处理照片
         async function handlePhoto(file) {
             const reader = new FileReader();
-
-            // 读取EXIF时间
             let photoTime = null;
             try {
                 photoTime = await extractExifDateTime(file);
@@ -421,14 +760,11 @@
             reader.onload = (e) => {
                 document.getElementById('previewImg').src = e.target.result;
                 document.getElementById('uploadPreview').classList.remove('hidden');
-
-                // 模拟OCR识别（实际应用需要调用OCR API）
                 simulateOCR(e.target.result, photoTime);
             };
             reader.readAsDataURL(file);
         }
 
-        // 模拟OCR识别
         function simulateOCR(imageData, photoTime) {
             const ocrResult = document.getElementById('ocrResult');
             const ocrText = document.getElementById('ocrText');
@@ -436,10 +772,7 @@
             ocrResult.classList.remove('hidden');
             ocrText.innerHTML = '<i class="fas fa-spinner fa-spin mr-2"></i>正在识别...';
 
-            // 这里模拟OCR识别过程
-            // 实际应用中应该调用OCR API（如百度OCR、腾讯OCR等）
             setTimeout(() => {
-                // 模拟识别结果 - 实际应用中这里应该是真实的OCR结果
                 const mockResults = [
                     { sys: 125, dia: 82, hr: 76 },
                     { sys: 118, dia: 78, hr: 72 },
@@ -447,7 +780,6 @@
                 ];
                 const result = mockResults[Math.floor(Math.random() * mockResults.length)];
 
-                // 处理照片时间
                 let timeInfo = '';
                 let timeParam = '';
                 let periodParam = '';
@@ -468,7 +800,6 @@
                         </div>
                     `;
 
-                    // 准备传给fillForm的时间参数
                     photoTime.setMinutes(photoTime.getMinutes() - photoTime.getTimezoneOffset());
                     timeParam = photoTime.toISOString().slice(0, 16);
                     periodParam = period;
@@ -507,24 +838,18 @@
             }, 1500);
         }
 
-        // 填充表单
         function fillForm(sys, dia, hr, timeStr, period) {
             document.getElementById('systolic').value = sys;
             document.getElementById('diastolic').value = dia;
             document.getElementById('heartRate').value = hr;
-
-            // 如果提供了时间，填入时间字段
             if (timeStr) {
                 document.getElementById('measureTime').value = timeStr;
             }
-
-            // 如果提供了时段，选择对应时段
             if (period) {
                 document.getElementById('timePeriod').value = period;
             }
         }
 
-        // 添加记录
         function addRecord(e) {
             e.preventDefault();
 
@@ -546,18 +871,15 @@
             updateStats();
             updateChart();
 
-            // 重置表单
             document.getElementById('bpForm').reset();
             document.getElementById('uploadPreview').classList.add('hidden');
             document.getElementById('ocrResult').classList.add('hidden');
 
-            // 重新设置默认时间
             const now = new Date();
             now.setMinutes(now.getMinutes() - now.getTimezoneOffset());
             document.getElementById('measureTime').value = now.toISOString().slice(0, 16);
         }
 
-        // 获取血压状态
         function getBPStatus(sys, dia) {
             if (sys < 120 && dia < 80) return { label: '正常', class: 'status-normal' };
             if (sys < 130 && dia < 80) return { label: '正常偏高', class: 'status-warning' };
@@ -566,7 +888,6 @@
             return { label: '重度高血压', class: 'status-danger' };
         }
 
-        // 渲染表格
         function renderTable() {
             const tbody = document.getElementById('recordsTable');
             const emptyState = document.getElementById('emptyState');
@@ -621,7 +942,6 @@
             }).join('');
         }
 
-        // 更新统计
         function updateStats() {
             if (bpRecords.length === 0) {
                 document.getElementById('avgSystolic').textContent = '--';
@@ -644,7 +964,6 @@
             document.getElementById('totalRecords').textContent = bpRecords.length;
         }
 
-        // 初始化图表
         function initChart() {
             const ctx = document.getElementById('bpChart').getContext('2d');
             chart = new Chart(ctx, {
@@ -674,33 +993,22 @@
                     responsive: true,
                     maintainAspectRatio: false,
                     plugins: {
-                        legend: {
-                            position: 'top',
-                        }
+                        legend: { position: 'top' }
                     },
                     scales: {
-                        y: {
-                            beginAtZero: false,
-                            min: 40,
-                            max: 200
-                        }
+                        y: { beginAtZero: false, min: 40, max: 200 }
                     }
                 }
             });
-
             updateChart();
         }
 
-        // 更新图表
         function updateChart() {
             if (!chart || bpRecords.length === 0) return;
 
-            // 按时间排序（从早到晚）
             const sortedRecords = [...bpRecords].sort((a, b) =>
                 new Date(a.measureTime) - new Date(b.measureTime)
             );
-
-            // 只显示最近30条记录
             const recentRecords = sortedRecords.slice(-30);
 
             chart.data.labels = recentRecords.map(r => {
@@ -712,7 +1020,6 @@
             chart.update();
         }
 
-        // 打开编辑弹窗
         function openEditModal(id) {
             const record = bpRecords.find(r => r.id === id);
             if (!record) return;
@@ -724,7 +1031,6 @@
             document.getElementById('editTimePeriod').value = record.timePeriod;
             document.getElementById('editNotes').value = record.notes || '';
 
-            // 设置时间
             const measureTime = new Date(record.measureTime);
             measureTime.setMinutes(measureTime.getMinutes() - measureTime.getTimezoneOffset());
             document.getElementById('editMeasureTime').value = measureTime.toISOString().slice(0, 16);
@@ -732,19 +1038,16 @@
             document.getElementById('editModal').classList.remove('hidden');
         }
 
-        // 关闭编辑弹窗
         function closeEditModal() {
             document.getElementById('editModal').classList.add('hidden');
             document.getElementById('editForm').reset();
         }
 
-        // 保存编辑
         function saveEdit(e) {
             e.preventDefault();
 
             const id = parseInt(document.getElementById('editId').value);
             const recordIndex = bpRecords.findIndex(r => r.id === id);
-
             if (recordIndex === -1) return;
 
             bpRecords[recordIndex] = {
@@ -757,7 +1060,6 @@
                 notes: document.getElementById('editNotes').value
             };
 
-            // 按时间重新排序
             bpRecords.sort((a, b) => new Date(b.measureTime) - new Date(a.measureTime));
 
             saveData();
@@ -767,14 +1069,10 @@
             closeEditModal();
         }
 
-        // 点击弹窗外部关闭
         document.getElementById('editModal').addEventListener('click', function(e) {
-            if (e.target === this) {
-                closeEditModal();
-            }
+            if (e.target === this) closeEditModal();
         });
 
-        // 删除记录
         function deleteRecord(id) {
             if (confirm('确定要删除这条记录吗？')) {
                 bpRecords = bpRecords.filter(r => r.id !== id);
@@ -785,9 +1083,8 @@
             }
         }
 
-        // 清空所有数据
         function clearAllData() {
-            if (confirm('确定要清空所有记录吗？此操作不可恢复！')) {
+            if (confirm('确定要清空所有记录吗？建议先备份！')) {
                 bpRecords = [];
                 saveData();
                 renderTable();
@@ -796,7 +1093,6 @@
             }
         }
 
-        // 导出数据
         function exportData() {
             if (bpRecords.length === 0) {
                 alert('暂无数据可导出');
@@ -826,11 +1122,6 @@
             link.href = URL.createObjectURL(blob);
             link.download = `血压记录_${new Date().toLocaleDateString('zh-CN')}.csv`;
             link.click();
-        }
-
-        // 保存数据
-        function saveData() {
-            localStorage.setItem('bpRecords', JSON.stringify(bpRecords));
         }
     </script>
 </body>
